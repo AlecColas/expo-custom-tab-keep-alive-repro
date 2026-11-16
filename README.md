@@ -81,6 +81,47 @@ Then:
 
 To run it: `git switch keep-alive && npm install` (applies `patches/expo-web-browser+58.0.8.patch` and builds `expo-web-browser` from source through `expo.autolinking.android.buildFromSource`), then rebuild the release. Back on `main`, run `rm -rf node_modules/expo-web-browser && npm install` to restore the unpatched module.
 
+## How it fails, and the fix
+
+### Stock `expo-web-browser`
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant App as App process
+    participant Chrome as Chrome (Custom Tab)
+    participant Android
+    App->>Chrome: openAuthSessionAsync → CustomTabsIntent (no session, no KEEP_ALIVE)
+    Note over App: oom adj 700 ("previous app"): reclaimable
+    User->>Android: leaves the tab (SMS, email…)
+    Android--xApp: memory pressure (or am kill): process killed, the tab stays open
+    User->>Chrome: Finish login
+    Chrome->>Android: VIEW keepalivedemo://redirect?code=…
+    Android->>App: new process, MainActivity restarted, redirect via onNewIntent
+    Note over App: the pending openAuthSessionAsync died with the old process
+    App-->>User: no result, no url event, getInitialURL null
+```
+
+### Patched (`keep-alive` branch)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant App as App process
+    participant Chrome as Chrome (Custom Tab)
+    participant Android
+    App->>Chrome: bindService(CustomTabsService), if not bound yet
+    App->>Chrome: warmup(0), newSession()
+    App->>Chrome: CustomTabsIntent(session) + KEEP_ALIVE → KeepAliveService
+    Chrome->>App: binds KeepAliveService
+    Note over App: oom adj 100 (visible): not reclaimed
+    User->>Android: leaves the tab (SMS, email…)
+    Android-->>App: am kill refused, same PID
+    User->>Chrome: Finish login
+    Chrome->>App: VIEW keepalivedemo://redirect?code=… (same process)
+    App-->>User: openAuthSessionAsync resolves with type "success" and the url
+```
+
 ## What the patch does
 
 All in `expo-web-browser/android`:
