@@ -1,0 +1,177 @@
+diff --git a/node_modules/expo-web-browser/android/src/main/AndroidManifest.xml b/node_modules/expo-web-browser/android/src/main/AndroidManifest.xml
+index 1e1e021..2b12ec5 100644
+--- a/node_modules/expo-web-browser/android/src/main/AndroidManifest.xml
++++ b/node_modules/expo-web-browser/android/src/main/AndroidManifest.xml
+@@ -13,5 +13,8 @@
+         android:launchMode="singleTop"
+         android:theme="@android:style/Theme.Translucent.NoTitleBar"
+         android:exported="false"/>
++    <service
++        android:name=".KeepAliveService"
++        android:exported="true"/>
+   </application>
+ </manifest>
+diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
+index 7a2f6d2..0e4e359 100644
+--- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
++++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
+@@ -6,6 +6,12 @@ import android.net.Uri
+ import androidx.browser.customtabs.CustomTabsClient
+ import androidx.browser.customtabs.CustomTabsServiceConnection
+ import androidx.browser.customtabs.CustomTabsSession
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++
++private const val KEEP_ALIVE_CONNECTION_TIMEOUT_MS = 1000L
+ 
+ internal class CustomTabsConnectionHelper(
+   private val context: Context
+@@ -13,6 +19,24 @@ internal class CustomTabsConnectionHelper(
+   private var currentPackageName: String? = null
+   private val clientActions = DeferredClientActionsQueue<CustomTabsClient>()
+   private val sessionActions = DeferredClientActionsQueue<CustomTabsSession?>()
++  private var connectedClient: CustomTabsClient? = null
++  private var keepAliveSession: CustomTabsSession? = null
++
++  suspend fun awaitSessionForKeepAlive(packageName: String): CustomTabsSession? {
++    val connected = CompletableDeferred<Unit>()
++    withContext(Dispatchers.Main) {
++      ensureConnection(packageName)
++      clientActions.executeOrQueueAction { connected.complete(Unit) }
++    }
++    withTimeoutOrNull(KEEP_ALIVE_CONNECTION_TIMEOUT_MS) { connected.await() }
++    return withContext(Dispatchers.Main) {
++      if (!isConnectionStarted(packageName)) {
++        return@withContext null
++      }
++      connectedClient?.warmup(0)
++      keepAliveSession ?: connectedClient?.newSession(null)?.also { keepAliveSession = it }
++    }
++  }
+ 
+   // region lifecycle methods
+   fun destroy() = clearConnection()
+@@ -50,6 +74,7 @@ internal class CustomTabsConnectionHelper(
+ 
+   override fun onCustomTabsServiceConnected(componentName: ComponentName, client: CustomTabsClient) {
+     if (isConnectionStarted(componentName.packageName)) {
++      connectedClient = client
+       clientActions.setClient(client)
+     }
+   }
+@@ -91,6 +116,8 @@ internal class CustomTabsConnectionHelper(
+     }
+ 
+     currentPackageName = null
++    connectedClient = null
++    keepAliveSession = null
+     clientActions.clear()
+     sessionActions.clear()
+   }
+diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/KeepAliveService.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/KeepAliveService.kt
+new file mode 100644
+index 0000000..fd925fa
+--- /dev/null
++++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/KeepAliveService.kt
+@@ -0,0 +1,12 @@
++package expo.modules.webbrowser
++
++import android.app.Service
++import android.content.Intent
++import android.os.Binder
++import android.os.IBinder
++
++class KeepAliveService : Service() {
++  private val binder = Binder()
++
++  override fun onBind(intent: Intent?): IBinder = binder
++}
+diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
+index 30fb758..3bb6575 100644
+--- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
++++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
+@@ -1,12 +1,15 @@
+ package expo.modules.webbrowser
+ 
++import android.content.Intent
+ import android.os.Bundle
+ import android.text.TextUtils
+ import androidx.browser.customtabs.CustomTabColorSchemeParams
+ import androidx.browser.customtabs.CustomTabsIntent
++import androidx.browser.customtabs.CustomTabsSession
+ import androidx.core.os.bundleOf
+ import expo.modules.core.utilities.ifNull
+ import expo.modules.kotlin.exception.Exceptions
++import expo.modules.kotlin.functions.Coroutine
+ import expo.modules.kotlin.modules.Module
+ import expo.modules.kotlin.modules.ModuleDefinition
+ import androidx.core.net.toUri
+@@ -19,6 +22,8 @@ private const val DEFAULT_BROWSER_PACKAGE = "defaultBrowserPackage"
+ 
+ private const val MODULE_NAME = "ExpoWebBrowser"
+ 
++private const val EXTRA_KEEP_ALIVE = "android.support.customtabs.extra.KEEP_ALIVE"
++
+ class WebBrowserModule : Module() {
+   private val context
+     get() = appContext.reactContext ?: throw Exceptions.ReactContextLost()
+@@ -80,8 +85,9 @@ class WebBrowserModule : Module() {
+       }
+     }
+ 
+-    AsyncFunction("openBrowserAsync") { url: String, options: OpenBrowserOptions ->
+-      val tabsIntent = createCustomTabsIntent(options).apply {
++    AsyncFunction("openBrowserAsync") Coroutine { url: String, options: OpenBrowserOptions ->
++      val keepAliveSession = keepAliveSessionOrNull(options)
++      val tabsIntent = createCustomTabsIntent(options, keepAliveSession).apply {
+         intent.data = url.toUri()
+       }
+ 
+@@ -97,7 +103,7 @@ class WebBrowserModule : Module() {
+ 
+       customTabsResolver.startCustomTabs(tabsIntent, options)
+ 
+-      return@AsyncFunction bundleOf(
++      return@Coroutine bundleOf(
+         "type" to "opened"
+       )
+     }
+@@ -107,8 +113,11 @@ class WebBrowserModule : Module() {
+   internal lateinit var customTabsResolver: CustomTabsActivitiesHelper
+   internal lateinit var connectionHelper: CustomTabsConnectionHelper
+ 
+-  private fun createCustomTabsIntent(options: OpenBrowserOptions): CustomTabsIntent {
+-    val builder = CustomTabsIntent.Builder()
++  private fun createCustomTabsIntent(
++    options: OpenBrowserOptions,
++    keepAliveSession: CustomTabsSession?
++  ): CustomTabsIntent {
++    val builder = keepAliveSession?.let { CustomTabsIntent.Builder(it) } ?: CustomTabsIntent.Builder()
+ 
+     val toolbarColor = options.toolbarColor
+     val secondaryToolbarColor = options.secondaryToolbarColor
+@@ -135,7 +144,22 @@ class WebBrowserModule : Module() {
+       if (!TextUtils.isEmpty(packageName)) {
+         intent.setPackage(packageName)
+       }
++      if (keepAliveSession != null) {
++        intent.putExtra(
++          EXTRA_KEEP_ALIVE,
++          Intent().setClassName(context.packageName, KeepAliveService::class.java.name)
++        )
++      }
++    }
++  }
++
++  private suspend fun keepAliveSessionOrNull(options: OpenBrowserOptions): CustomTabsSession? {
++    val packageName = try {
++      givenOrPreferredPackageName(options.browserPackage)
++    } catch (_: NoPreferredPackageFound) {
++      return null
+     }
++    return connectionHelper.awaitSessionForKeepAlive(packageName)
+   }
+ 
+   /**
