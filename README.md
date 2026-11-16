@@ -89,7 +89,7 @@ All in `expo-web-browser/android`:
 - `CustomTabsConnectionHelper.awaitSessionForKeepAlive(packageName)`: binds to the browser's `CustomTabsService` if needed (waiting up to 1 s), calls `warmup(0)`, and returns a `CustomTabsSession`.
 - `openBrowserAsync`: builds the tab with `CustomTabsIntent.Builder(session)` and puts `KEEP_ALIVE` = an `Intent` targeting `KeepAliveService`. Without a session (no Custom Tabs browser, or timeout), the tab opens exactly as before.
 
-**`warmup()` is required.** With the session and the extra but no prior `warmup()`, Chrome 145 did not bind `KeepAliveService` (`oom adj` stayed at 700). Calling `WebBrowser.warmUpAsync()` from JS, or `warmup(0)` natively as the patch does, was enough to get the binding.
+**`warmup()` was needed in practice.** With the session and the extra but no prior `warmup()`, Chrome 145 did not bind `KeepAliveService` (`oom adj` stayed at 700). Calling `WebBrowser.warmUpAsync()` from JS, or `warmup(0)` natively as the patch does, was enough to get the binding. Neither the [Android](https://developer.android.com/develop/ui/views/layout/webapps/overview-of-android-custom-tabs) nor the [Chrome](https://developer.chrome.com/docs/android/custom-tabs/guide-warmup-prefetch) documentation ties the keep-alive to `warmup()`, and Chromium's `ClientManager.keepAliveForSession` does not check it, so this is an observation on one Chrome version, not a documented requirement.
 
 ## References
 
