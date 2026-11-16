@@ -12,10 +12,15 @@ index 1e1e021..2b12ec5 100644
    </application>
  </manifest>
 diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-index 7a2f6d2..0e4e359 100644
+index 7a2f6d2..effa771 100644
 --- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
 +++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-@@ -6,6 +6,12 @@ import android.net.Uri
+@@ -3,9 +3,19 @@ package expo.modules.webbrowser
+ import android.content.ComponentName
+ import android.content.Context
+ import android.net.Uri
++import android.os.Bundle
++import androidx.browser.customtabs.CustomTabsCallback
  import androidx.browser.customtabs.CustomTabsClient
  import androidx.browser.customtabs.CustomTabsServiceConnection
  import androidx.browser.customtabs.CustomTabsSession
@@ -25,15 +30,28 @@ index 7a2f6d2..0e4e359 100644
 +import kotlinx.coroutines.withTimeoutOrNull
 +
 +private const val KEEP_ALIVE_CONNECTION_TIMEOUT_MS = 1000L
++private const val KEEP_ALIVE_WARMUP_TIMEOUT_MS = 2000L
++private const val ON_WARMUP_COMPLETED = "onWarmupCompleted"
  
  internal class CustomTabsConnectionHelper(
    private val context: Context
-@@ -13,6 +19,24 @@ internal class CustomTabsConnectionHelper(
+@@ -13,6 +23,44 @@ internal class CustomTabsConnectionHelper(
    private var currentPackageName: String? = null
    private val clientActions = DeferredClientActionsQueue<CustomTabsClient>()
    private val sessionActions = DeferredClientActionsQueue<CustomTabsSession?>()
 +  private var connectedClient: CustomTabsClient? = null
 +  private var keepAliveSession: CustomTabsSession? = null
++
++  @Volatile
++  private var pendingWarmup: CompletableDeferred<Unit>? = null
++
++  private val keepAliveCallback = object : CustomTabsCallback() {
++    override fun extraCallback(callbackName: String, args: Bundle?) {
++      if (callbackName == ON_WARMUP_COMPLETED) {
++        pendingWarmup?.complete(Unit)
++      }
++    }
++  }
 +
 +  suspend fun awaitSessionForKeepAlive(packageName: String): CustomTabsSession? {
 +    val connected = CompletableDeferred<Unit>()
@@ -42,18 +60,27 @@ index 7a2f6d2..0e4e359 100644
 +      clientActions.executeOrQueueAction { connected.complete(Unit) }
 +    }
 +    withTimeoutOrNull(KEEP_ALIVE_CONNECTION_TIMEOUT_MS) { connected.await() }
-+    return withContext(Dispatchers.Main) {
++    val warmedUp = CompletableDeferred<Unit>()
++    val session = withContext(Dispatchers.Main) {
 +      if (!isConnectionStarted(packageName)) {
 +        return@withContext null
 +      }
-+      connectedClient?.warmup(0)
-+      keepAliveSession ?: connectedClient?.newSession(null)?.also { keepAliveSession = it }
-+    }
++      val client = connectedClient ?: return@withContext null
++      val session = keepAliveSession
++        ?: client.newSession(keepAliveCallback)?.also { keepAliveSession = it }
++        ?: return@withContext null
++      pendingWarmup = warmedUp
++      client.warmup(0)
++      session
++    } ?: return null
++    withTimeoutOrNull(KEEP_ALIVE_WARMUP_TIMEOUT_MS) { warmedUp.await() }
++    pendingWarmup = null
++    return session
 +  }
  
    // region lifecycle methods
    fun destroy() = clearConnection()
-@@ -50,6 +74,7 @@ internal class CustomTabsConnectionHelper(
+@@ -50,6 +98,7 @@ internal class CustomTabsConnectionHelper(
  
    override fun onCustomTabsServiceConnected(componentName: ComponentName, client: CustomTabsClient) {
      if (isConnectionStarted(componentName.packageName)) {
@@ -61,7 +88,7 @@ index 7a2f6d2..0e4e359 100644
        clientActions.setClient(client)
      }
    }
-@@ -91,6 +116,8 @@ internal class CustomTabsConnectionHelper(
+@@ -91,6 +140,8 @@ internal class CustomTabsConnectionHelper(
      }
  
      currentPackageName = null
