@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fake auth page</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        padding: 24px;
+      }
+      a {
+        display: inline-block;
+        padding: 16px 24px;
+        background: #1a73e8;
+        color: #fff;
+        border-radius: 8px;
+        text-decoration: none;
+        font-size: 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Fake auth page</h1>
+    <p>
+      Stands in for an OAuth provider step the user can leave (e.g. reading an
+      SMS code).
+    </p>
+    <p><a id="finish">Finish login</a></p>
+    <script>
+      const redirectUri =
+        new URLSearchParams(location.search).get("redirect_uri") ||
+        "keepalivedemo://redirect";
+      document.getElementById("finish").href =
+        redirectUri + "?code=demo-code&state=demo-state";
+    </script>
+  </body>
+</html>
