@@ -12,10 +12,10 @@ index 1e1e021..2b12ec5 100644
    </application>
  </manifest>
 diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-index 7a2f6d2..effa771 100644
+index 7a2f6d2..1e97fcc 100644
 --- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
 +++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-@@ -3,9 +3,19 @@ package expo.modules.webbrowser
+@@ -3,9 +3,25 @@ package expo.modules.webbrowser
  import android.content.ComponentName
  import android.content.Context
  import android.net.Uri
@@ -32,10 +32,16 @@ index 7a2f6d2..effa771 100644
 +private const val KEEP_ALIVE_CONNECTION_TIMEOUT_MS = 1000L
 +private const val KEEP_ALIVE_WARMUP_TIMEOUT_MS = 2000L
 +private const val ON_WARMUP_COMPLETED = "onWarmupCompleted"
++private val WARMUP_CALLBACK_PACKAGES = setOf(
++  "com.android.chrome",
++  "com.chrome.beta",
++  "com.chrome.dev",
++  "com.chrome.canary"
++)
  
  internal class CustomTabsConnectionHelper(
    private val context: Context
-@@ -13,6 +23,44 @@ internal class CustomTabsConnectionHelper(
+@@ -13,6 +29,46 @@ internal class CustomTabsConnectionHelper(
    private var currentPackageName: String? = null
    private val clientActions = DeferredClientActionsQueue<CustomTabsClient>()
    private val sessionActions = DeferredClientActionsQueue<CustomTabsSession?>()
@@ -73,14 +79,16 @@ index 7a2f6d2..effa771 100644
 +      client.warmup(0)
 +      session
 +    } ?: return null
-+    withTimeoutOrNull(KEEP_ALIVE_WARMUP_TIMEOUT_MS) { warmedUp.await() }
++    if (packageName in WARMUP_CALLBACK_PACKAGES) {
++      withTimeoutOrNull(KEEP_ALIVE_WARMUP_TIMEOUT_MS) { warmedUp.await() }
++    }
 +    pendingWarmup = null
 +    return session
 +  }
  
    // region lifecycle methods
    fun destroy() = clearConnection()
-@@ -50,6 +98,7 @@ internal class CustomTabsConnectionHelper(
+@@ -50,6 +106,7 @@ internal class CustomTabsConnectionHelper(
  
    override fun onCustomTabsServiceConnected(componentName: ComponentName, client: CustomTabsClient) {
      if (isConnectionStarted(componentName.packageName)) {
@@ -88,7 +96,7 @@ index 7a2f6d2..effa771 100644
        clientActions.setClient(client)
      }
    }
-@@ -91,6 +140,8 @@ internal class CustomTabsConnectionHelper(
+@@ -91,6 +148,8 @@ internal class CustomTabsConnectionHelper(
      }
  
      currentPackageName = null
