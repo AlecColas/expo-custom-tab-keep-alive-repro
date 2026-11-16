@@ -73,6 +73,9 @@ Then:
 
 ### `keep-alive` (patched)
 
+> [!WARNING]
+> **Work in progress.** The results below were measured while Chrome had already been warmed up by this app. On a clean run (emulator rebooted, so Chrome starts cold, and no JS `warmUpAsync()`), the current patch does **not** keep the app alive: `oom adj` stays at 700 and `am kill` kills it. Chromium cancels pending warm-up tasks when it handles the tab intent, so the patch's `warmup(0)` call right before the launch has no effect. A fix that waits for `onWarmupCompleted` before launching is being tested. Until then, calling `WebBrowser.warmUpAsync()` well before opening the tab (for example on mount) is what made the keep-alive work.
+
 | Step         | Observed                                                       |
 | ------------ | -------------------------------------------------------------- |
 | Tab in front | `oom adj` 100; Chrome is bound to the app's `KeepAliveService` |
@@ -130,7 +133,7 @@ All in `expo-web-browser/android`:
 - `CustomTabsConnectionHelper.awaitSessionForKeepAlive(packageName)`: binds to the browser's `CustomTabsService` if needed (waiting up to 1 s), calls `warmup(0)`, and returns a `CustomTabsSession`.
 - `openBrowserAsync`: builds the tab with `CustomTabsIntent.Builder(session)` and puts `KEEP_ALIVE` = an `Intent` targeting `KeepAliveService`. Without a session (no Custom Tabs browser, or timeout), the tab opens exactly as before.
 
-**`warmup()` was needed in practice.** With the session and the extra but no prior `warmup()`, Chrome 145 did not bind `KeepAliveService` (`oom adj` stayed at 700). Calling `WebBrowser.warmUpAsync()` from JS, or `warmup(0)` natively as the patch does, was enough to get the binding. Neither the [Android](https://developer.android.com/develop/ui/views/layout/webapps/overview-of-android-custom-tabs) nor the [Chrome](https://developer.chrome.com/docs/android/custom-tabs/guide-warmup-prefetch) documentation ties the keep-alive to `warmup()`, and Chromium's `ClientManager.keepAliveForSession` does not check it, so this is an observation on one Chrome version, not a documented requirement.
+**`warmup()` was needed in practice.** With the session and the extra but no prior `warmup()`, Chrome 145 did not bind `KeepAliveService` (`oom adj` stayed at 700). Calling `WebBrowser.warmUpAsync()` from JS on mount, well before the tab opened, was enough to get the binding. Calling `warmup(0)` natively right before the launch, as the current patch does, was not: see the warning above. Neither the [Android](https://developer.android.com/develop/ui/views/layout/webapps/overview-of-android-custom-tabs) nor the [Chrome](https://developer.chrome.com/docs/android/custom-tabs/guide-warmup-prefetch) documentation ties the keep-alive to `warmup()`, and Chromium's `ClientManager.keepAliveForSession` does not check it, so this is an observation on one Chrome version, not a documented requirement.
 
 ## References
 
