@@ -12,23 +12,21 @@ index 1e1e021..2b12ec5 100644
    </application>
  </manifest>
 diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-index 7a2f6d2..1e97fcc 100644
+index 7a2f6d2..54a7dc1 100644
 --- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
 +++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-@@ -3,9 +3,25 @@ package expo.modules.webbrowser
+@@ -3,16 +3,90 @@ package expo.modules.webbrowser
  import android.content.ComponentName
  import android.content.Context
  import android.net.Uri
 +import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
 +import androidx.browser.customtabs.CustomTabsCallback
  import androidx.browser.customtabs.CustomTabsClient
  import androidx.browser.customtabs.CustomTabsServiceConnection
  import androidx.browser.customtabs.CustomTabsSession
-+import kotlinx.coroutines.CompletableDeferred
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.withContext
-+import kotlinx.coroutines.withTimeoutOrNull
-+
+ 
 +private const val KEEP_ALIVE_CONNECTION_TIMEOUT_MS = 1000L
 +private const val KEEP_ALIVE_WARMUP_TIMEOUT_MS = 2000L
 +private const val ON_WARMUP_COMPLETED = "onWarmupCompleted"
@@ -38,69 +36,80 @@ index 7a2f6d2..1e97fcc 100644
 +  "com.chrome.dev",
 +  "com.chrome.canary"
 +)
- 
++
  internal class CustomTabsConnectionHelper(
    private val context: Context
-@@ -13,6 +29,46 @@ internal class CustomTabsConnectionHelper(
+ ) : CustomTabsServiceConnection() {
    private var currentPackageName: String? = null
    private val clientActions = DeferredClientActionsQueue<CustomTabsClient>()
    private val sessionActions = DeferredClientActionsQueue<CustomTabsSession?>()
-+  private var connectedClient: CustomTabsClient? = null
 +  private var keepAliveSession: CustomTabsSession? = null
 +
++  private val mainHandler = Handler(Looper.getMainLooper())
++
 +  @Volatile
-+  private var pendingWarmup: CompletableDeferred<Unit>? = null
++  private var onWarmupCompleted: Runnable? = null
 +
 +  private val keepAliveCallback = object : CustomTabsCallback() {
 +    override fun extraCallback(callbackName: String, args: Bundle?) {
 +      if (callbackName == ON_WARMUP_COMPLETED) {
-+        pendingWarmup?.complete(Unit)
++        onWarmupCompleted?.let { mainHandler.post(it) }
 +      }
 +    }
 +  }
 +
-+  suspend fun awaitSessionForKeepAlive(packageName: String): CustomTabsSession? {
-+    val connected = CompletableDeferred<Unit>()
-+    withContext(Dispatchers.Main) {
-+      ensureConnection(packageName)
-+      clientActions.executeOrQueueAction { connected.complete(Unit) }
-+    }
-+    withTimeoutOrNull(KEEP_ALIVE_CONNECTION_TIMEOUT_MS) { connected.await() }
-+    val warmedUp = CompletableDeferred<Unit>()
-+    val session = withContext(Dispatchers.Main) {
-+      if (!isConnectionStarted(packageName)) {
-+        return@withContext null
++  /**
++   * Gets a session the Custom Tab can be launched with so that the browser keeps this app alive
++   * (`KEEP_ALIVE`) while the tab is open. Binds to the browser if needed and warms it up.
++   *
++   * Chrome only binds the app once a warm-up has completed, and it cancels a pending warm-up as soon
++   * as it handles the tab intent, so for Chrome this waits for `onWarmupCompleted` before returning.
++   * Other browsers are not waited for: Firefox, for one, never sends that callback.
++   *
++   * [onReady] is called exactly once, on the main thread, with the session, or with `null` when the
++   * browser could not be reached in time. The tab should then be opened without keep-alive.
++   */
++  fun requestKeepAliveSession(packageName: String, onReady: (CustomTabsSession?) -> Unit) {
++    mainHandler.post {
++      var finished = false
++      var session: CustomTabsSession? = null
++      lateinit var timeout: Runnable
++      val finish = {
++        if (!finished) {
++          finished = true
++          mainHandler.removeCallbacks(timeout)
++          onWarmupCompleted = null
++          onReady(session)
++        }
 +      }
-+      val client = connectedClient ?: return@withContext null
-+      val session = keepAliveSession
-+        ?: client.newSession(keepAliveCallback)?.also { keepAliveSession = it }
-+        ?: return@withContext null
-+      pendingWarmup = warmedUp
-+      client.warmup(0)
-+      session
-+    } ?: return null
-+    if (packageName in WARMUP_CALLBACK_PACKAGES) {
-+      withTimeoutOrNull(KEEP_ALIVE_WARMUP_TIMEOUT_MS) { warmedUp.await() }
++      timeout = Runnable { finish() }
++      mainHandler.postDelayed(timeout, KEEP_ALIVE_CONNECTION_TIMEOUT_MS)
++
++      ensureConnection(packageName)
++      clientActions.executeOrQueueAction { client: CustomTabsClient ->
++        if (finished || !isConnectionStarted(packageName)) {
++          return@executeOrQueueAction
++        }
++        session = keepAliveSession ?: client.newSession(keepAliveCallback)?.also { keepAliveSession = it }
++        if (session == null || packageName !in WARMUP_CALLBACK_PACKAGES) {
++          client.warmup(0)
++          finish()
++          return@executeOrQueueAction
++        }
++        mainHandler.removeCallbacks(timeout)
++        mainHandler.postDelayed(timeout, KEEP_ALIVE_WARMUP_TIMEOUT_MS)
++        onWarmupCompleted = Runnable { finish() }
++        client.warmup(0)
++      }
 +    }
-+    pendingWarmup = null
-+    return session
 +  }
  
    // region lifecycle methods
    fun destroy() = clearConnection()
-@@ -50,6 +106,7 @@ internal class CustomTabsConnectionHelper(
- 
-   override fun onCustomTabsServiceConnected(componentName: ComponentName, client: CustomTabsClient) {
-     if (isConnectionStarted(componentName.packageName)) {
-+      connectedClient = client
-       clientActions.setClient(client)
-     }
-   }
-@@ -91,6 +148,8 @@ internal class CustomTabsConnectionHelper(
+@@ -91,6 +165,7 @@ internal class CustomTabsConnectionHelper(
      }
  
      currentPackageName = null
-+    connectedClient = null
 +    keepAliveSession = null
      clientActions.clear()
      sessionActions.clear()
@@ -124,10 +133,10 @@ index 0000000..fd925fa
 +  override fun onBind(intent: Intent?): IBinder = binder
 +}
 diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
-index 30fb758..3bb6575 100644
+index 30fb758..ee03c5b 100644
 --- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
 +++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
-@@ -1,12 +1,15 @@
+@@ -1,12 +1,17 @@
  package expo.modules.webbrowser
  
 +import android.content.Intent
@@ -138,12 +147,14 @@ index 30fb758..3bb6575 100644
 +import androidx.browser.customtabs.CustomTabsSession
  import androidx.core.os.bundleOf
  import expo.modules.core.utilities.ifNull
++import expo.modules.kotlin.Promise
++import expo.modules.kotlin.exception.CodedException
  import expo.modules.kotlin.exception.Exceptions
-+import expo.modules.kotlin.functions.Coroutine
++import expo.modules.kotlin.exception.UnexpectedException
  import expo.modules.kotlin.modules.Module
  import expo.modules.kotlin.modules.ModuleDefinition
  import androidx.core.net.toUri
-@@ -19,6 +22,8 @@ private const val DEFAULT_BROWSER_PACKAGE = "defaultBrowserPackage"
+@@ -19,6 +24,8 @@ private const val DEFAULT_BROWSER_PACKAGE = "defaultBrowserPackage"
  
  private const val MODULE_NAME = "ExpoWebBrowser"
  
@@ -152,34 +163,71 @@ index 30fb758..3bb6575 100644
  class WebBrowserModule : Module() {
    private val context
      get() = appContext.reactContext ?: throw Exceptions.ReactContextLost()
-@@ -80,8 +85,9 @@ class WebBrowserModule : Module() {
+@@ -80,14 +87,33 @@ class WebBrowserModule : Module() {
        }
      }
  
 -    AsyncFunction("openBrowserAsync") { url: String, options: OpenBrowserOptions ->
 -      val tabsIntent = createCustomTabsIntent(options).apply {
-+    AsyncFunction("openBrowserAsync") Coroutine { url: String, options: OpenBrowserOptions ->
-+      val keepAliveSession = keepAliveSessionOrNull(options)
-+      val tabsIntent = createCustomTabsIntent(options, keepAliveSession).apply {
-         intent.data = url.toUri()
+-        intent.data = url.toUri()
++    AsyncFunction("openBrowserAsync") { url: String, options: OpenBrowserOptions, promise: Promise ->
++      if (!customTabsResolver.canResolveIntent(createCustomTabsIntent(url, options, null))) {
++        throw NoMatchingActivityException()
        }
  
-@@ -97,7 +103,7 @@ class WebBrowserModule : Module() {
+-      if (!customTabsResolver.canResolveIntent(tabsIntent)) {
+-        throw NoMatchingActivityException()
++      val keepAlivePackageName = keepAlivePackageNameOrNull(options)
++      if (keepAlivePackageName == null) {
++        startCustomTab(url, options, null, promise)
++        return@AsyncFunction
++      }
++
++      // Ask the browser to keep this app alive while the tab is open. Without it, Android can
++      // reclaim the app as soon as the tab covers it, and the auth redirect is lost.
++      connectionHelper.requestKeepAliveSession(keepAlivePackageName) { session ->
++        startCustomTab(url, options, session, promise)
+       }
++    }
++  }
++
++  private fun startCustomTab(
++    url: String,
++    options: OpenBrowserOptions,
++    keepAliveSession: CustomTabsSession?,
++    promise: Promise
++  ) {
++    try {
++      val tabsIntent = createCustomTabsIntent(url, options, keepAliveSession)
+ 
+       if (options.browserPackage.isNullOrEmpty() && tabsIntent.intent.`package` == null) {
+         customTabsResolver.getPreferredCustomTabsResolvingActivity(null)?.let {
+@@ -97,9 +123,15 @@ class WebBrowserModule : Module() {
  
        customTabsResolver.startCustomTabs(tabsIntent, options)
  
 -      return@AsyncFunction bundleOf(
-+      return@Coroutine bundleOf(
-         "type" to "opened"
+-        "type" to "opened"
++      promise.resolve(
++        bundleOf(
++          "type" to "opened"
++        )
        )
++    } catch (e: CodedException) {
++      promise.reject(e)
++    } catch (e: Throwable) {
++      promise.reject(UnexpectedException(e))
      }
-@@ -107,8 +113,11 @@ class WebBrowserModule : Module() {
+   }
+ 
+@@ -107,8 +139,12 @@ class WebBrowserModule : Module() {
    internal lateinit var customTabsResolver: CustomTabsActivitiesHelper
    internal lateinit var connectionHelper: CustomTabsConnectionHelper
  
 -  private fun createCustomTabsIntent(options: OpenBrowserOptions): CustomTabsIntent {
 -    val builder = CustomTabsIntent.Builder()
 +  private fun createCustomTabsIntent(
++    url: String,
 +    options: OpenBrowserOptions,
 +    keepAliveSession: CustomTabsSession?
 +  ): CustomTabsIntent {
@@ -187,7 +235,12 @@ index 30fb758..3bb6575 100644
  
      val toolbarColor = options.toolbarColor
      val secondaryToolbarColor = options.secondaryToolbarColor
-@@ -135,7 +144,22 @@ class WebBrowserModule : Module() {
+@@ -131,10 +167,25 @@ class WebBrowserModule : Module() {
+     builder.setUrlBarHidingEnabled(options.enableBarCollapsing)
+ 
+     return builder.build().apply {
++      intent.data = url.toUri()
+       val packageName = options.browserPackage
        if (!TextUtils.isEmpty(packageName)) {
          intent.setPackage(packageName)
        }
@@ -200,13 +253,11 @@ index 30fb758..3bb6575 100644
 +    }
 +  }
 +
-+  private suspend fun keepAliveSessionOrNull(options: OpenBrowserOptions): CustomTabsSession? {
-+    val packageName = try {
++  private fun keepAlivePackageNameOrNull(options: OpenBrowserOptions): String? {
++    return try {
 +      givenOrPreferredPackageName(options.browserPackage)
 +    } catch (_: NoPreferredPackageFound) {
-+      return null
++      null
      }
-+    return connectionHelper.awaitSessionForKeepAlive(packageName)
    }
  
-   /**
