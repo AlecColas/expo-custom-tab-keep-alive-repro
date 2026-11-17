@@ -20,6 +20,7 @@ Chrome can keep the opener alive for the lifetime of the tab, but only when aske
 
 - `main`: stock `create-expo-app` (blank-typescript) + `expo-web-browser`. Reproduces the bug.
 - `keep-alive`: same app with a `patch-package` patch on `expo-web-browser` that opens the tab with a session and `KEEP_ALIVE`. Shows the fix.
+- `keep-alive-rebased`: the patch is the code of [expo/expo#53576](https://github.com/expo/expo/pull/53576) after its rebase on [#53527](https://github.com/expo/expo/pull/53527) (authentication-session headers), and the app has a second button that opens the auth session with `additionalHeaderFields`. See [With authentication headers](#with-authentication-headers).
 
 ## The app
 
@@ -82,6 +83,30 @@ Measured with Chrome started cold (`am force-stop com.android.chrome` before lau
 | Finish login | same process; `{"type":"success", …}`, `url` event received    |
 
 To run it: `git switch keep-alive && npm install` (applies `patches/expo-web-browser+58.0.8.patch` and builds `expo-web-browser` from source through `expo.autolinking.android.buildFromSource`), then rebuild the release. Back on `main`, run `rm -rf node_modules/expo-web-browser && npm install` to restore the unpatched module.
+
+### With authentication headers
+
+On the `keep-alive-rebased` branch, **Start auth session with headers** calls `openAuthSessionAsync` with `additionalHeaderFields`. On Android, that option needs an HTTPS URL whose origin the browser verifies for the app through Digital Asset Links. `auth-page/.well-known/assetlinks.json` declares `delegate_permission/common.use_as_origin` for `com.example.keepalivedemo`, signed with `android/app/debug.keystore` (the release build uses it).
+
+1. Serve `auth-page/` from a public HTTPS origin. For example, with a temporary tunnel:
+   ```sh
+   npm run serve-auth-page
+   cloudflared tunnel --url http://localhost:8000   # prints https://<random>.trycloudflare.com
+   ```
+2. Build the release with that origin:
+   ```sh
+   EXPO_PUBLIC_HTTPS_AUTH_ORIGIN=https://<random>.trycloudflare.com npm run android:release
+   ```
+3. Tap **Start auth session with headers**, then follow steps 2 to 4 of [Reproduce](#reproduce).
+
+Measured on the same emulator and Chrome version, with this branch:
+
+| Scenario                              | Runs | `oom adj` with the tab in front | `am kill`         | Finish login                                       |
+| ------------------------------------- | ---- | ------------------------------- | ----------------- | -------------------------------------------------- |
+| No headers, Chrome cold               | 10   | 100                             | refused, same PID | checked in 7 runs: `type: "success"`, same process |
+| `additionalHeaderFields`, Chrome cold | 5    | 100                             | refused, same PID | `type: "success"`, same process                    |
+| No headers, Chrome warm               | 1    | 100                             | refused, same PID | `type: "success"`, same process                    |
+| `additionalHeaderFields`, Chrome warm | 1    | 100                             | refused, same PID | `type: "success"`, same process                    |
 
 ## How it fails, and the fix
 

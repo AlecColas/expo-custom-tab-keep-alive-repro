@@ -12,21 +12,31 @@ index 1e1e021..2b12ec5 100644
    </application>
  </manifest>
 diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-index 7a2f6d2..54a7dc1 100644
+index 7a2f6d2..74c4938 100644
 --- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
 +++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/CustomTabsConnectionHelper.kt
-@@ -3,16 +3,90 @@ package expo.modules.webbrowser
+@@ -2,10 +2,33 @@ package expo.modules.webbrowser
+ 
  import android.content.ComponentName
  import android.content.Context
++import android.content.Intent
++import android.content.ServiceConnection
  import android.net.Uri
++import android.os.Build
 +import android.os.Bundle
 +import android.os.Handler
++import android.os.IBinder
 +import android.os.Looper
++import android.os.SystemClock
 +import androidx.browser.customtabs.CustomTabsCallback
  import androidx.browser.customtabs.CustomTabsClient
++import androidx.browser.customtabs.CustomTabsService
  import androidx.browser.customtabs.CustomTabsServiceConnection
  import androidx.browser.customtabs.CustomTabsSession
- 
++import expo.modules.kotlin.Promise
++import expo.modules.kotlin.exception.CodedException
++import expo.modules.kotlin.exception.toCodedException
++
 +private const val KEEP_ALIVE_CONNECTION_TIMEOUT_MS = 1000L
 +private const val KEEP_ALIVE_WARMUP_TIMEOUT_MS = 2000L
 +private const val ON_WARMUP_COMPLETED = "onWarmupCompleted"
@@ -36,16 +46,16 @@ index 7a2f6d2..54a7dc1 100644
 +  "com.chrome.dev",
 +  "com.chrome.canary"
 +)
-+
+ 
  internal class CustomTabsConnectionHelper(
    private val context: Context
- ) : CustomTabsServiceConnection() {
+@@ -13,17 +36,41 @@ internal class CustomTabsConnectionHelper(
    private var currentPackageName: String? = null
    private val clientActions = DeferredClientActionsQueue<CustomTabsClient>()
    private val sessionActions = DeferredClientActionsQueue<CustomTabsSession?>()
++  private val handler = Handler(Looper.getMainLooper())
++  private var pendingBrowserOpen: PendingBrowserOpen? = null
 +  private var keepAliveSession: CustomTabsSession? = null
-+
-+  private val mainHandler = Handler(Looper.getMainLooper())
 +
 +  @Volatile
 +  private var onWarmupCompleted: Runnable? = null
@@ -53,60 +63,299 @@ index 7a2f6d2..54a7dc1 100644
 +  private val keepAliveCallback = object : CustomTabsCallback() {
 +    override fun extraCallback(callbackName: String, args: Bundle?) {
 +      if (callbackName == ON_WARMUP_COMPLETED) {
-+        onWarmupCompleted?.let { mainHandler.post(it) }
++        onWarmupCompleted?.let { handler.post(it) }
++      }
++    }
++  }
++
++  private class PendingBrowserOpen(
++    val promise: Promise,
++    var open: ((CustomTabsSession) -> Bundle)?
++  ) {
++    var priorityConnection: ServiceConnection? = null
++  }
+ 
+   // region lifecycle methods
++  @Synchronized
+   fun destroy() = clearConnection()
+   // endregion
+ 
+   // region Actual connection helper methods
++  @Synchronized
+   fun warmUp(packageName: String) {
+     clientActions.executeOrQueueAction { client: CustomTabsClient -> client.warmup(0) }
+     ensureConnection(packageName)
+   }
+ 
++  @Synchronized
+   fun mayInitWithUrl(packageName: String, uri: Uri) {
+     sessionActions.executeOrQueueAction { session: CustomTabsSession? ->
+       session?.mayLaunchUrl(uri, null, null)
+@@ -32,6 +79,7 @@ internal class CustomTabsConnectionHelper(
+     ensureSession()
+   }
+ 
++  @Synchronized
+   fun coolDown(packageName: String): Boolean {
+     if (isConnectionStarted(packageName)) {
+       clearConnection()
+@@ -39,21 +87,180 @@ internal class CustomTabsConnectionHelper(
+     }
+     return false
+   }
++
++  @Synchronized
++  fun openWithHeaders(
++    packageName: String,
++    origin: Uri,
++    promise: Promise,
++    open: (CustomTabsSession) -> Bundle
++  ) {
++    if (pendingBrowserOpen != null) {
++      throw BrowserHeadersException("A browser is awaiting origin verification. Wait for it to finish before opening another.")
++    }
++    if (!ensureConnection(packageName)) {
++      throw BrowserHeadersException("Could not connect to the selected browser. Use a browser that supports Custom Tabs.")
++    }
++
++    val pending = PendingBrowserOpen(promise, open)
++    pendingBrowserOpen = pending
++    handler.postAtTime(
++      {
++        rejectPendingOpen(
++          pending,
++          BrowserHeadersException("Browser origin verification timed out. Check the browser's network access and Digital Asset Links configuration.")
++        )
++      },
++      pending,
++      SystemClock.uptimeMillis() + 30_000
++    )
++    // A separate connection keeps verification online without raising the prewarm binding's priority.
++    val connection = object : ServiceConnection {
++      override fun onServiceConnected(name: ComponentName, service: IBinder) {
++        verifyOrigin(pending, origin)
++      }
++
++      override fun onServiceDisconnected(name: ComponentName) = Unit
++    }
++    pending.priorityConnection = connection
++    val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++      Context.BIND_AUTO_CREATE or Context.BIND_NOT_PERCEPTIBLE
++    } else {
++      Context.BIND_AUTO_CREATE
++    }
++    try {
++      val intent = Intent(CustomTabsService.ACTION_CUSTOM_TABS_CONNECTION).setPackage(packageName)
++      if (!context.bindService(intent, connection, flags)) {
++        releasePriorityConnection(pending)
++        verifyOrigin(pending, origin)
++      }
++    } catch (error: Exception) {
++      rejectPendingOpen(pending, error.toCodedException())
++    }
++  }
++
++  @Synchronized
++  private fun verifyOrigin(pending: PendingBrowserOpen, origin: Uri) {
++    if (pendingBrowserOpen !== pending) {
++      return
++    }
++    clientActions.executeOrQueueAction { client ->
++      if (pendingBrowserOpen !== pending) {
++        return@executeOrQueueAction
++      }
++      try {
++        client.warmup(0)
++        lateinit var session: CustomTabsSession
++        val callback = object : CustomTabsCallback() {
++          override fun onRelationshipValidationResult(
++            relation: Int,
++            requestedOrigin: Uri,
++            result: Boolean,
++            extras: Bundle?
++          ) {
++            if (relation != CustomTabsService.RELATION_USE_AS_ORIGIN || requestedOrigin != origin) {
++              return
++            }
++            if (!result) {
++              rejectPendingOpen(
++                pending,
++                BrowserHeadersException("The browser did not verify this app for the HTTPS origin. Check its Digital Asset Links configuration.")
++              )
++              return
++            }
++            openPendingBrowser(pending, session)
++          }
++        }
++        session = client.newSession(callback)
++          ?: throw BrowserHeadersException("The browser could not create a verification session. Use a browser that supports origin verification.")
++        if (!session.validateRelationship(CustomTabsService.RELATION_USE_AS_ORIGIN, origin, null)) {
++          rejectPendingOpen(
++            pending,
++            BrowserHeadersException("The browser rejected origin verification. Use a browser that supports Digital Asset Links.")
++          )
++        }
++      } catch (error: Exception) {
++        rejectPendingOpen(pending, error.toCodedException())
 +      }
 +    }
 +  }
 +
 +  /**
-+   * Gets a session the Custom Tab can be launched with so that the browser keeps this app alive
++   * Gets a session to launch the Custom Tab with, so that the browser keeps this app alive
 +   * (`KEEP_ALIVE`) while the tab is open. Binds to the browser if needed and warms it up.
 +   *
-+   * Chrome only binds the app once a warm-up has completed, and it cancels a pending warm-up as soon
-+   * as it handles the tab intent, so for Chrome this waits for `onWarmupCompleted` before returning.
-+   * Other browsers are not waited for: Firefox, for one, never sends that callback.
++   * Chrome only binds the app once a warm-up has completed, and it cancels a pending warm-up when
++   * it handles the tab intent. For Chrome, this waits for `onWarmupCompleted` before returning.
++   * It does not wait for other browsers: Firefox, for one, never sends that callback.
 +   *
-+   * [onReady] is called exactly once, on the main thread, with the session, or with `null` when the
-+   * browser could not be reached in time. The tab should then be opened without keep-alive.
++   * Calls [onReady] exactly once, on the main thread, with the session, or with `null` when the
++   * browser does not answer in time. The caller then opens the tab without keep-alive.
 +   */
 +  fun requestKeepAliveSession(packageName: String, onReady: (CustomTabsSession?) -> Unit) {
-+    mainHandler.post {
-+      var finished = false
-+      var session: CustomTabsSession? = null
-+      lateinit var timeout: Runnable
-+      val finish = {
-+        if (!finished) {
-+          finished = true
-+          mainHandler.removeCallbacks(timeout)
-+          onWarmupCompleted = null
-+          onReady(session)
-+        }
-+      }
-+      timeout = Runnable { finish() }
-+      mainHandler.postDelayed(timeout, KEEP_ALIVE_CONNECTION_TIMEOUT_MS)
++    handler.post { startKeepAliveSessionRequest(packageName, onReady) }
++  }
 +
-+      ensureConnection(packageName)
-+      clientActions.executeOrQueueAction { client: CustomTabsClient ->
-+        if (finished || !isConnectionStarted(packageName)) {
-+          return@executeOrQueueAction
-+        }
-+        session = keepAliveSession ?: client.newSession(keepAliveCallback)?.also { keepAliveSession = it }
-+        if (session == null || packageName !in WARMUP_CALLBACK_PACKAGES) {
-+          client.warmup(0)
-+          finish()
-+          return@executeOrQueueAction
-+        }
-+        mainHandler.removeCallbacks(timeout)
-+        mainHandler.postDelayed(timeout, KEEP_ALIVE_WARMUP_TIMEOUT_MS)
-+        onWarmupCompleted = Runnable { finish() }
-+        client.warmup(0)
++  @Synchronized
++  private fun startKeepAliveSessionRequest(packageName: String, onReady: (CustomTabsSession?) -> Unit) {
++    var finished = false
++    var session: CustomTabsSession? = null
++    lateinit var timeout: Runnable
++    val finish = {
++      if (!finished) {
++        finished = true
++        handler.removeCallbacks(timeout)
++        onWarmupCompleted = null
++        onReady(session)
 +      }
 +    }
++    timeout = Runnable { finish() }
++
++    if (!ensureConnection(packageName)) {
++      finish()
++      return
++    }
++    handler.postDelayed(timeout, KEEP_ALIVE_CONNECTION_TIMEOUT_MS)
++    clientActions.executeOrQueueAction { client: CustomTabsClient ->
++      if (finished || !isConnectionStarted(packageName)) {
++        return@executeOrQueueAction
++      }
++      session = keepAliveSession ?: client.newSession(keepAliveCallback)?.also { keepAliveSession = it }
++      if (session == null || packageName !in WARMUP_CALLBACK_PACKAGES) {
++        client.warmup(0)
++        finish()
++        return@executeOrQueueAction
++      }
++      handler.removeCallbacks(timeout)
++      handler.postDelayed(timeout, KEEP_ALIVE_WARMUP_TIMEOUT_MS)
++      onWarmupCompleted = Runnable { finish() }
++      client.warmup(0)
++    }
 +  }
++
++  @Synchronized
++  fun cancelPendingBrowserOpen() {
++    pendingBrowserOpen?.let {
++      rejectPendingOpen(it, BrowserHeadersException("The pending browser request was canceled. Open a new authentication session to try again."))
++    }
++  }
+   // endregion
  
-   // region lifecycle methods
-   fun destroy() = clearConnection()
-@@ -91,6 +165,7 @@ internal class CustomTabsConnectionHelper(
+   // region CustomTabsServiceConnection implementation
++  @Synchronized
+   override fun onBindingDied(componentName: ComponentName) {
+     if (isConnectionStarted(componentName.packageName)) {
+       clearConnection()
+     }
+   }
+ 
++  @Synchronized
+   override fun onCustomTabsServiceConnected(componentName: ComponentName, client: CustomTabsClient) {
+     if (isConnectionStarted(componentName.packageName)) {
+       clientActions.setClient(client)
+     }
+   }
+ 
++  @Synchronized
+   override fun onServiceDisconnected(componentName: ComponentName) {
+     if (isConnectionStarted(componentName.packageName)) {
+       clearConnection()
+@@ -61,6 +268,44 @@ internal class CustomTabsConnectionHelper(
+   }
+   // endregion
+ 
++  // Module calls and browser callbacks use different queues; cancellation must not race a launch.
++  @Synchronized
++  private fun openPendingBrowser(pending: PendingBrowserOpen, session: CustomTabsSession) {
++    if (pendingBrowserOpen !== pending) {
++      return
++    }
++    val open = checkNotNull(pending.open)
++    pending.open = null
++    pendingBrowserOpen = null
++    handler.removeCallbacksAndMessages(pending)
++    try {
++      pending.promise.resolve(open(session))
++    } catch (error: Exception) {
++      pending.promise.reject(error.toCodedException())
++    } finally {
++      releasePriorityConnection(pending)
++    }
++  }
++
++  @Synchronized
++  private fun rejectPendingOpen(pending: PendingBrowserOpen, error: CodedException) {
++    if (pendingBrowserOpen !== pending) {
++      return
++    }
++    pending.open = null
++    pendingBrowserOpen = null
++    handler.removeCallbacksAndMessages(pending)
++    releasePriorityConnection(pending)
++    pending.promise.reject(error)
++  }
++
++  private fun releasePriorityConnection(pending: PendingBrowserOpen) {
++    val connection = pending.priorityConnection ?: return
++    pending.priorityConnection = null
++    // Android registers the connection even when bindService returns false.
++    context.unbindService(connection)
++  }
++
+   private fun ensureSession() {
+     if (sessionActions.hasClient()) {
+       return
+@@ -71,14 +316,18 @@ internal class CustomTabsConnectionHelper(
+     }
+   }
+ 
+-  private fun ensureConnection(packageName: String) {
++  private fun ensureConnection(packageName: String): Boolean {
+     if (currentPackageName != null && currentPackageName != packageName) {
+       clearConnection()
+     }
+     if (!isConnectionStarted(packageName)) {
+-      CustomTabsClient.bindCustomTabsService(context, packageName, this)
+-      currentPackageName = packageName
++      val bound = CustomTabsClient.bindCustomTabsService(context, packageName, this)
++      if (bound) {
++        currentPackageName = packageName
++      }
++      return bound
+     }
++    return true
+   }
+ 
+   private fun isConnectionStarted(packageName: String): Boolean {
+@@ -86,11 +335,15 @@ internal class CustomTabsConnectionHelper(
+   }
+ 
+   private fun clearConnection() {
++    pendingBrowserOpen?.let {
++      rejectPendingOpen(it, BrowserHeadersException("The browser disconnected before opening. Open a new authentication session to try again."))
++    }
+     if (currentPackageName != null) {
+       context.unbindService(this)
      }
  
      currentPackageName = null
@@ -132,8 +381,18 @@ index 0000000..fd925fa
 +
 +  override fun onBind(intent: Intent?): IBinder = binder
 +}
+diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserExceptions.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserExceptions.kt
+index 80a1919..a29b5ea 100644
+--- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserExceptions.kt
++++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserExceptions.kt
+@@ -13,3 +13,5 @@ internal class PackageManagerNotFoundException : CodedException("Package Manager
+ internal class NoMatchingActivityException : CodedException("No matching browser activity found")
+ 
+ internal class NoUrlProvidedException : CodedException("No url provided")
++
++internal class BrowserHeadersException(message: String) : CodedException(message)
 diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
-index 30fb758..ee03c5b 100644
+index 30fb758..6e61b49 100644
 --- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
 +++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserModule.kt
 @@ -1,12 +1,17 @@
@@ -141,6 +400,7 @@ index 30fb758..ee03c5b 100644
  
 +import android.content.Intent
  import android.os.Bundle
++import android.provider.Browser
  import android.text.TextUtils
  import androidx.browser.customtabs.CustomTabColorSchemeParams
  import androidx.browser.customtabs.CustomTabsIntent
@@ -148,9 +408,8 @@ index 30fb758..ee03c5b 100644
  import androidx.core.os.bundleOf
  import expo.modules.core.utilities.ifNull
 +import expo.modules.kotlin.Promise
-+import expo.modules.kotlin.exception.CodedException
  import expo.modules.kotlin.exception.Exceptions
-+import expo.modules.kotlin.exception.UnexpectedException
++import expo.modules.kotlin.exception.toCodedException
  import expo.modules.kotlin.modules.Module
  import expo.modules.kotlin.modules.ModuleDefinition
  import androidx.core.net.toUri
@@ -163,88 +422,111 @@ index 30fb758..ee03c5b 100644
  class WebBrowserModule : Module() {
    private val context
      get() = appContext.reactContext ?: throw Exceptions.ReactContextLost()
-@@ -80,14 +87,33 @@ class WebBrowserModule : Module() {
+@@ -80,26 +87,70 @@ class WebBrowserModule : Module() {
        }
      }
  
 -    AsyncFunction("openBrowserAsync") { url: String, options: OpenBrowserOptions ->
 -      val tabsIntent = createCustomTabsIntent(options).apply {
 -        intent.data = url.toUri()
+-      }
 +    AsyncFunction("openBrowserAsync") { url: String, options: OpenBrowserOptions, promise: Promise ->
-+      if (!customTabsResolver.canResolveIntent(createCustomTabsIntent(url, options, null))) {
-+        throw NoMatchingActivityException()
-       }
++      val uri = url.toUri()
++      val headers = options.additionalHeaderFields
++      val open = { session: CustomTabsSession? ->
++        val tabsIntent = createCustomTabsIntent(options, session).apply {
++          intent.data = uri
++          if (headers != null) {
++            intent.putExtra(
++              Browser.EXTRA_HEADERS,
++              Bundle().apply {
++                headers.forEach { (name, value) -> putString(name, value) }
++              }
++            )
++          }
++        }
  
 -      if (!customTabsResolver.canResolveIntent(tabsIntent)) {
 -        throw NoMatchingActivityException()
-+      val keepAlivePackageName = keepAlivePackageNameOrNull(options)
-+      if (keepAlivePackageName == null) {
-+        startCustomTab(url, options, null, promise)
-+        return@AsyncFunction
-+      }
+-      }
++        if (!customTabsResolver.canResolveIntent(tabsIntent)) {
++          throw NoMatchingActivityException()
++        }
+ 
+-      if (options.browserPackage.isNullOrEmpty() && tabsIntent.intent.`package` == null) {
+-        customTabsResolver.getPreferredCustomTabsResolvingActivity(null)?.let {
+-          tabsIntent.intent.setPackage(it)
++        if (options.browserPackage.isNullOrEmpty() && tabsIntent.intent.`package` == null) {
++          customTabsResolver.getPreferredCustomTabsResolvingActivity(null)?.let {
++            tabsIntent.intent.setPackage(it)
++          }
+         }
 +
-+      // Ask the browser to keep this app alive while the tab is open. Without it, Android can
-+      // reclaim the app as soon as the tab covers it, and the auth redirect is lost.
-+      connectionHelper.requestKeepAliveSession(keepAlivePackageName) { session ->
-+        startCustomTab(url, options, session, promise)
++        customTabsResolver.startCustomTabs(tabsIntent, options)
++        bundleOf("type" to "opened")
        }
-+    }
-+  }
-+
-+  private fun startCustomTab(
-+    url: String,
-+    options: OpenBrowserOptions,
-+    keepAliveSession: CustomTabsSession?,
-+    promise: Promise
-+  ) {
-+    try {
-+      val tabsIntent = createCustomTabsIntent(url, options, keepAliveSession)
  
-       if (options.browserPackage.isNullOrEmpty() && tabsIntent.intent.`package` == null) {
-         customTabsResolver.getPreferredCustomTabsResolvingActivity(null)?.let {
-@@ -97,9 +123,15 @@ class WebBrowserModule : Module() {
- 
-       customTabsResolver.startCustomTabs(tabsIntent, options)
+-      customTabsResolver.startCustomTabs(tabsIntent, options)
++      if (headers == null) {
++        // Keep throwing synchronously when no browser can open the tab.
++        val probeIntent = createCustomTabsIntent(options, null).apply { intent.data = uri }
++        if (!customTabsResolver.canResolveIntent(probeIntent)) {
++          throw NoMatchingActivityException()
++        }
  
 -      return@AsyncFunction bundleOf(
 -        "type" to "opened"
-+      promise.resolve(
-+        bundleOf(
-+          "type" to "opened"
-+        )
-       )
-+    } catch (e: CodedException) {
-+      promise.reject(e)
-+    } catch (e: Throwable) {
-+      promise.reject(UnexpectedException(e))
+-      )
++        val keepAlivePackageName = keepAlivePackageNameOrNull(options)
++        if (keepAlivePackageName == null) {
++          promise.resolve(open(null))
++          return@AsyncFunction
++        }
++
++        // Ask the browser to keep this app alive while the tab is open. Without it, Android can
++        // reclaim the app as soon as the tab covers it, and the app loses the auth redirect.
++        connectionHelper.requestKeepAliveSession(keepAlivePackageName) { session ->
++          try {
++            promise.resolve(open(session))
++          } catch (error: Exception) {
++            promise.reject(error.toCodedException())
++          }
++        }
++        return@AsyncFunction
++      }
++      if (!"https".equals(uri.scheme, ignoreCase = true) || uri.host.isNullOrEmpty() || uri.userInfo != null) {
++        throw BrowserHeadersException("Authentication headers require an HTTPS URL without URL credentials. Update the authentication URL.")
++      }
++      val packageName = givenOrPreferredPackageName(options.browserPackage)
++      val origin = uri.buildUpon().scheme("https").path(null).query(null).fragment(null).build()
++      connectionHelper.openWithHeaders(packageName, origin, promise, open)
++    }
++
++    AsyncFunction("cancelPendingBrowserOpen") {
++      connectionHelper.cancelPendingBrowserOpen()
      }
    }
  
-@@ -107,8 +139,12 @@ class WebBrowserModule : Module() {
+@@ -107,8 +158,8 @@ class WebBrowserModule : Module() {
    internal lateinit var customTabsResolver: CustomTabsActivitiesHelper
    internal lateinit var connectionHelper: CustomTabsConnectionHelper
  
 -  private fun createCustomTabsIntent(options: OpenBrowserOptions): CustomTabsIntent {
 -    val builder = CustomTabsIntent.Builder()
-+  private fun createCustomTabsIntent(
-+    url: String,
-+    options: OpenBrowserOptions,
-+    keepAliveSession: CustomTabsSession?
-+  ): CustomTabsIntent {
-+    val builder = keepAliveSession?.let { CustomTabsIntent.Builder(it) } ?: CustomTabsIntent.Builder()
++  private fun createCustomTabsIntent(options: OpenBrowserOptions, session: CustomTabsSession?): CustomTabsIntent {
++    val builder = CustomTabsIntent.Builder(session)
  
      val toolbarColor = options.toolbarColor
      val secondaryToolbarColor = options.secondaryToolbarColor
-@@ -131,10 +167,25 @@ class WebBrowserModule : Module() {
-     builder.setUrlBarHidingEnabled(options.enableBarCollapsing)
+@@ -132,9 +183,23 @@ class WebBrowserModule : Module() {
  
      return builder.build().apply {
-+      intent.data = url.toUri()
        val packageName = options.browserPackage
-       if (!TextUtils.isEmpty(packageName)) {
+-      if (!TextUtils.isEmpty(packageName)) {
++      if (session == null && !TextUtils.isEmpty(packageName)) {
          intent.setPackage(packageName)
        }
-+      if (keepAliveSession != null) {
++      if (session != null) {
 +        intent.putExtra(
 +          EXTRA_KEEP_ALIVE,
 +          Intent().setClassName(context.packageName, KeepAliveService::class.java.name)
@@ -261,3 +543,256 @@ index 30fb758..ee03c5b 100644
      }
    }
  
+diff --git a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserOptions.kt b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserOptions.kt
+index e906e82..4d344a1 100644
+--- a/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserOptions.kt
++++ b/node_modules/expo-web-browser/android/src/main/java/expo/modules/webbrowser/WebBrowserOptions.kt
+@@ -6,6 +6,7 @@ import expo.modules.kotlin.types.OptimizedRecord
+ 
+ @OptimizedRecord
+ internal data class OpenBrowserOptions(
++  @Field val additionalHeaderFields: Map<String, String>? = null,
+   @Field val toolbarColor: Int? = null,
+   @Field val secondaryToolbarColor: Int? = null,
+   @Field val browserPackage: String? = null,
+diff --git a/node_modules/expo-web-browser/build/WebBrowser.js b/node_modules/expo-web-browser/build/WebBrowser.js
+index d30ee73..427379b 100644
+--- a/node_modules/expo-web-browser/build/WebBrowser.js
++++ b/node_modules/expo-web-browser/build/WebBrowser.js
+@@ -170,6 +170,9 @@ const emptyCustomTabsPackages = {
+  * - If the browser is closed using [`dismissBrowser`](#webbrowserdismissbrowser),
+  * the Promise fulfills with `{ type: 'dismiss' }` object.
+  */ export async function openAuthSessionAsync(url, redirectUrl, options = {}) {
++    if (Platform.OS === 'web' && options.additionalHeaderFields != null) {
++        throw new UnavailabilityError('WebBrowser', 'additionalHeaderFields');
++    }
+     if (_authSessionIsNativelySupported()) {
+         if (!ExponentWebBrowser.openAuthSessionAsync) {
+             throw new UnavailabilityError('WebBrowser', 'openAuthSessionAsync');
+@@ -266,26 +269,29 @@ let _onWebBrowserCloseAndroid = null;
+ // is triggered instead by the bridge capturing the current state
+ // (https://reactnative.dev/docs/appstate#basic-usage)
+ let _isAppStateAvailable = AppState.currentState !== null;
+-function _onAppStateChangeAndroid(state) {
++function _onAppStateChangeAndroid(state, canDismissBrowser) {
+     if (!_isAppStateAvailable) {
+         _isAppStateAvailable = true;
+         return;
+     }
+-    if (state === 'active' && _onWebBrowserCloseAndroid) {
++    if (state === 'active' && canDismissBrowser && _onWebBrowserCloseAndroid) {
+         _onWebBrowserCloseAndroid();
+     }
+ }
+ async function _openBrowserAndWaitAndroidAsync(startUrl, browserParams = {}) {
++    let browserOpened = false;
+     const appStateChangedToActive = new Promise((resolve)=>{
+         _onWebBrowserCloseAndroid = resolve;
+     });
+-    const stateChangeSubscription = AppState.addEventListener('change', _onAppStateChangeAndroid);
++    // Origin verification can span an app foreground cycle before any browser opens.
++    const stateChangeSubscription = AppState.addEventListener('change', (state)=>_onAppStateChangeAndroid(state, browserParams.additionalHeaderFields == null || browserOpened));
+     let result = {
+         type: WebBrowserResultType.CANCEL
+     };
+     let type = null;
+     try {
+         ({ type } = await openBrowserAsync(startUrl, browserParams));
++        browserOpened = type === 'opened';
+     } catch (e) {
+         stateChangeSubscription.remove();
+         _onWebBrowserCloseAndroid = null;
+@@ -308,10 +314,12 @@ async function _openAuthSessionPolyfillAsync(startUrl, returnUrl, browserParams
+     if (_onWebBrowserCloseAndroid) {
+         throw new Error(`WebBrowser is already open, only one can be open at a time`);
+     }
++    let browserPromise;
+     try {
+         if (Platform.OS === 'android') {
++            browserPromise = _openBrowserAndWaitAndroidAsync(startUrl, browserParams);
+             return await Promise.race([
+-                _openBrowserAndWaitAndroidAsync(startUrl, browserParams),
++                browserPromise,
+                 _waitForRedirectAsync(returnUrl)
+             ]);
+         } else {
+@@ -321,6 +329,11 @@ async function _openAuthSessionPolyfillAsync(startUrl, returnUrl, browserParams
+             ]);
+         }
+     } finally{
++        if (Platform.OS === 'android' && browserParams.additionalHeaderFields != null) {
++            // Keep the auth guard until validation cannot launch and the old waiter has cleaned up.
++            await Promise.resolve(ExponentWebBrowser.cancelPendingBrowserOpen?.()).catch(()=>{}).then(()=>_onWebBrowserCloseAndroid?.());
++            await browserPromise?.catch(()=>{});
++        }
+         // We can't dismiss the browser on Android, only call this when it's available.
+         // Users on Android need to manually press the 'x' button in Chrome Custom Tabs, sadly.
+         if (ExponentWebBrowser.dismissBrowser) {
+diff --git a/node_modules/expo-web-browser/build/WebBrowser.js.map b/node_modules/expo-web-browser/build/WebBrowser.js.map
+index 7a30951..86d296d 100644
+--- a/node_modules/expo-web-browser/build/WebBrowser.js.map
++++ b/node_modules/expo-web-browser/build/WebBrowser.js.map
+@@ -1 +1 @@
+-{"version":3,"sources":["WebBrowser.ts"],"sourcesContent":[null],"names":["UnavailabilityError","AppState","Linking","Platform","processColor","ExponentWebBrowser","WebBrowserResultType","WebBrowserPresentationStyle","emptyCustomTabsPackages","defaultBrowserPackage","undefined","preferredBrowserPackage","browserPackages","servicePackages","getCustomTabsSupportingBrowsersAsync","OS","warmUpAsync","browserPackage","mayInitWithUrlAsync","url","coolDownAsync","openBrowserAsync","browserParams","_processOptions","dismissBrowser","openAuthSessionAsync","redirectUrl","options","_authSessionIsNativelySupported","includes","_openAuthSessionPolyfillAsync","dismissAuthSession","maybeCompleteAuthSession","type","message","controlsColor","toolbarColor","secondaryToolbarColor","_redirectSubscription","_onWebBrowserCloseAndroid","_isAppStateAvailable","currentState","_onAppStateChangeAndroid","state","_openBrowserAndWaitAndroidAsync","startUrl","appStateChangedToActive","Promise","resolve","stateChangeSubscription","addEventListener","result","CANCEL","e","remove","DISMISS","returnUrl","Error","race","_waitForRedirectAsync","_stopWaitingForRedirect","redirectHandler","event","startsWith"],"mappings":"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"}
+\ No newline at end of file
++{"version":3,"sources":["WebBrowser.ts"],"sourcesContent":[null],"names":["UnavailabilityError","AppState","Linking","Platform","processColor","ExponentWebBrowser","WebBrowserResultType","WebBrowserPresentationStyle","emptyCustomTabsPackages","defaultBrowserPackage","undefined","preferredBrowserPackage","browserPackages","servicePackages","getCustomTabsSupportingBrowsersAsync","OS","warmUpAsync","browserPackage","mayInitWithUrlAsync","url","coolDownAsync","openBrowserAsync","browserParams","_processOptions","dismissBrowser","openAuthSessionAsync","redirectUrl","options","additionalHeaderFields","_authSessionIsNativelySupported","includes","_openAuthSessionPolyfillAsync","dismissAuthSession","maybeCompleteAuthSession","type","message","controlsColor","toolbarColor","secondaryToolbarColor","_redirectSubscription","_onWebBrowserCloseAndroid","_isAppStateAvailable","currentState","_onAppStateChangeAndroid","state","canDismissBrowser","_openBrowserAndWaitAndroidAsync","startUrl","browserOpened","appStateChangedToActive","Promise","resolve","stateChangeSubscription","addEventListener","result","CANCEL","e","remove","DISMISS","returnUrl","Error","browserPromise","race","_waitForRedirectAsync","cancelPendingBrowserOpen","catch","then","_stopWaitingForRedirect","redirectHandler","event","startsWith"],"mappings":"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"}
+\ No newline at end of file
+diff --git a/node_modules/expo-web-browser/build/WebBrowser.types.d.ts b/node_modules/expo-web-browser/build/WebBrowser.types.d.ts
+index 88cacbb..a4fc410 100644
+--- a/node_modules/expo-web-browser/build/WebBrowser.types.d.ts
++++ b/node_modules/expo-web-browser/build/WebBrowser.types.d.ts
+@@ -98,6 +98,22 @@ export type WebBrowserOpenOptions = {
+  * [`WebBrowserOpenOptions`](#webbrowseropenoptions) will be used in the browser polyfill. Otherwise, the browser parameters will be ignored.
+  */
+ export type AuthSessionOpenOptions = WebBrowserOpenOptions & {
++    /**
++     * HTTP headers to supply when opening the authentication URL.
++     * On iOS 17.4 and macOS 14.4 or later, the system applies them to the initial request.
++     * Earlier versions and web reject this option.
++     *
++     * On Android, the URL must use HTTPS. The selected browser must verify your app and
++     * the URL's origin through Digital Asset Links with the
++     * `delegate_permission/common.use_as_origin` relation. Opening rejects if verification
++     * fails or does not finish within 30 seconds. The browser can filter headers and forward
++     * them on HTTP redirects; do not rely on headers staying on the initial request.
++     *
++     * Omitting this option preserves the normal authentication flow.
++     * @platform android
++     * @platform ios 17.4+
++     */
++    additionalHeaderFields?: Record<string, string>;
+     /**
+      * Determines whether the session should ask the browser for a private authentication session.
+      * Set this to `true` to request that the browser doesn’t share cookies or other browsing data between the authentication session and the user’s normal browser session.
+diff --git a/node_modules/expo-web-browser/build/WebBrowser.types.js.map b/node_modules/expo-web-browser/build/WebBrowser.types.js.map
+index 153a0b0..83f16cb 100644
+--- a/node_modules/expo-web-browser/build/WebBrowser.types.js.map
++++ b/node_modules/expo-web-browser/build/WebBrowser.types.js.map
+@@ -1 +1 @@
+-{"version":3,"sources":["WebBrowser.types.ts"],"sourcesContent":[null],"names":["WebBrowserResultType","WebBrowserPresentationStyle"],"mappings":"AA8JA,2BAA2B;AAC3B,OAAO,IAAA,AAAKA,8CAAAA;IACV;;GAEC;IAED;;GAEC;IAED;;GAEC;;WAXSA;MAcX;AAED,cAAc;AACd;;;;CAIC,GACD,OAAO,IAAA,AAAKC,qDAAAA;IACV;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;;GAGC;IAED;;;;;GAKC;WAnCSA;MAqCX"}
+\ No newline at end of file
++{"version":3,"sources":["WebBrowser.types.ts"],"sourcesContent":[null],"names":["WebBrowserResultType","WebBrowserPresentationStyle"],"mappings":"AA+KA,2BAA2B;AAC3B,OAAO,IAAA,AAAKA,8CAAAA;IACV;;GAEC;IAED;;GAEC;IAED;;GAEC;;WAXSA;MAcX;AAED,cAAc;AACd;;;;CAIC,GACD,OAAO,IAAA,AAAKC,qDAAAA;IACV;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;GAEC;IAED;;;GAGC;IAED;;;;;GAKC;WAnCSA;MAqCX"}
+\ No newline at end of file
+diff --git a/node_modules/expo-web-browser/src/WebBrowser.ts b/node_modules/expo-web-browser/src/WebBrowser.ts
+index 78a61c7..7f341d8 100644
+--- a/node_modules/expo-web-browser/src/WebBrowser.ts
++++ b/node_modules/expo-web-browser/src/WebBrowser.ts
+@@ -228,6 +228,10 @@ export async function openAuthSessionAsync(
+   redirectUrl?: string | null,
+   options: AuthSessionOpenOptions = {}
+ ): Promise<WebBrowserAuthSessionResult> {
++  if (Platform.OS === 'web' && options.additionalHeaderFields != null) {
++    throw new UnavailabilityError('WebBrowser', 'additionalHeaderFields');
++  }
++
+   if (_authSessionIsNativelySupported()) {
+     if (!ExponentWebBrowser.openAuthSessionAsync) {
+       throw new UnavailabilityError('WebBrowser', 'openAuthSessionAsync');
+@@ -332,31 +336,36 @@ let _onWebBrowserCloseAndroid: null | (() => void) = null;
+ // is triggered instead by the bridge capturing the current state
+ // (https://reactnative.dev/docs/appstate#basic-usage)
+ let _isAppStateAvailable: boolean = AppState.currentState !== null;
+-function _onAppStateChangeAndroid(state: AppStateStatus) {
++function _onAppStateChangeAndroid(state: AppStateStatus, canDismissBrowser: boolean) {
+   if (!_isAppStateAvailable) {
+     _isAppStateAvailable = true;
+     return;
+   }
+ 
+-  if (state === 'active' && _onWebBrowserCloseAndroid) {
++  if (state === 'active' && canDismissBrowser && _onWebBrowserCloseAndroid) {
+     _onWebBrowserCloseAndroid();
+   }
+ }
+ 
+ async function _openBrowserAndWaitAndroidAsync(
+   startUrl: string,
+-  browserParams: WebBrowserOpenOptions = {}
++  browserParams: AuthSessionOpenOptions = {}
+ ): Promise<WebBrowserResult> {
++  let browserOpened = false;
+   const appStateChangedToActive = new Promise<void>((resolve) => {
+     _onWebBrowserCloseAndroid = resolve;
+   });
+-  const stateChangeSubscription = AppState.addEventListener('change', _onAppStateChangeAndroid);
++  // Origin verification can span an app foreground cycle before any browser opens.
++  const stateChangeSubscription = AppState.addEventListener('change', (state) =>
++    _onAppStateChangeAndroid(state, browserParams.additionalHeaderFields == null || browserOpened)
++  );
+ 
+   let result: WebBrowserResult = { type: WebBrowserResultType.CANCEL };
+   let type: string | null = null;
+ 
+   try {
+     ({ type } = await openBrowserAsync(startUrl, browserParams));
++    browserOpened = type === 'opened';
+   } catch (e) {
+     stateChangeSubscription.remove();
+     _onWebBrowserCloseAndroid = null;
+@@ -376,7 +385,7 @@ async function _openBrowserAndWaitAndroidAsync(
+ async function _openAuthSessionPolyfillAsync(
+   startUrl: string,
+   returnUrl?: string | null,
+-  browserParams: WebBrowserOpenOptions = {}
++  browserParams: AuthSessionOpenOptions = {}
+ ): Promise<WebBrowserAuthSessionResult> {
+   if (_redirectSubscription) {
+     throw new Error(
+@@ -388,12 +397,11 @@ async function _openAuthSessionPolyfillAsync(
+     throw new Error(`WebBrowser is already open, only one can be open at a time`);
+   }
+ 
++  let browserPromise: Promise<WebBrowserResult> | undefined;
+   try {
+     if (Platform.OS === 'android') {
+-      return await Promise.race([
+-        _openBrowserAndWaitAndroidAsync(startUrl, browserParams),
+-        _waitForRedirectAsync(returnUrl),
+-      ]);
++      browserPromise = _openBrowserAndWaitAndroidAsync(startUrl, browserParams);
++      return await Promise.race([browserPromise, _waitForRedirectAsync(returnUrl)]);
+     } else {
+       return await Promise.race([
+         openBrowserAsync(startUrl, browserParams),
+@@ -401,6 +409,13 @@ async function _openAuthSessionPolyfillAsync(
+       ]);
+     }
+   } finally {
++    if (Platform.OS === 'android' && browserParams.additionalHeaderFields != null) {
++      // Keep the auth guard until validation cannot launch and the old waiter has cleaned up.
++      await Promise.resolve(ExponentWebBrowser.cancelPendingBrowserOpen?.())
++        .catch(() => {})
++        .then(() => _onWebBrowserCloseAndroid?.());
++      await browserPromise?.catch(() => {});
++    }
+     // We can't dismiss the browser on Android, only call this when it's available.
+     // Users on Android need to manually press the 'x' button in Chrome Custom Tabs, sadly.
+     if (ExponentWebBrowser.dismissBrowser) {
+diff --git a/node_modules/expo-web-browser/src/WebBrowser.types.ts b/node_modules/expo-web-browser/src/WebBrowser.types.ts
+index c48a462..28c9d02 100644
+--- a/node_modules/expo-web-browser/src/WebBrowser.types.ts
++++ b/node_modules/expo-web-browser/src/WebBrowser.types.ts
+@@ -103,6 +103,23 @@ export type WebBrowserOpenOptions = {
+  * [`WebBrowserOpenOptions`](#webbrowseropenoptions) will be used in the browser polyfill. Otherwise, the browser parameters will be ignored.
+  */
+ export type AuthSessionOpenOptions = WebBrowserOpenOptions & {
++  /**
++   * HTTP headers to supply when opening the authentication URL.
++   * On iOS 17.4 and macOS 14.4 or later, the system applies them to the initial request.
++   * Earlier versions and web reject this option.
++   *
++   * On Android, the URL must use HTTPS. The selected browser must verify your app and
++   * the URL's origin through Digital Asset Links with the
++   * `delegate_permission/common.use_as_origin` relation. Opening rejects if verification
++   * fails or does not finish within 30 seconds. The browser can filter headers and forward
++   * them on HTTP redirects; do not rely on headers staying on the initial request.
++   *
++   * Omitting this option preserves the normal authentication flow.
++   * @platform android
++   * @platform ios 17.4+
++   */
++  additionalHeaderFields?: Record<string, string>;
++
+   /**
+    * Determines whether the session should ask the browser for a private authentication session.
+    * Set this to `true` to request that the browser doesn’t share cookies or other browsing data between the authentication session and the user’s normal browser session.
